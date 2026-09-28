@@ -294,6 +294,7 @@ class VictronDBus:
         self._signal_paths_subscribed = False
         self._signal_handler_attached = False
         self._last_signal_reconcile = 0.0
+        self._next_grid_retry: float | None = None
         self._last_signal_setup_try = 0.0
         self._last_signal_ok_monotonic: float | None = None
         self._next_unhealthy_poll = 0.0
@@ -381,6 +382,7 @@ class VictronDBus:
                 self._refresh_grid_meter(applied_generation)
         elif generation == self._grid_telemetry.generation:
             self._grid_telemetry.unavailable("System grid snapshot unavailable")
+        self._schedule_grid_retry()
         for service, path in self._fast_targets():
             if service == SYSTEM_SERVICE and path in GRID_PATHS:
                 continue
@@ -815,6 +817,11 @@ class VictronDBus:
                 self._reconcile_pv_power()
                 self._reconcile_acload_power()
                 self._last_signal_reconcile = time.monotonic()
+            elif self._next_grid_retry is not None and time.monotonic() >= self._next_grid_retry:
+                # A failed authoritative read latches grid invalid even while
+                # signals continue. Recover the full snapshot promptly, with
+                # the same service backoff as ordinary reconciliation.
+                self._poll_system_data()
         else:
             if (
                 self._native is not None
@@ -897,9 +904,38 @@ class VictronDBus:
             self._reconcile_all_batteries()
 
     def _poll_system_data(self):
-        """Poll system data using tree query"""
+        """Reconcile one coherent snapshot without spawning a CLI on the native path."""
+        self._read_system_snapshot()
+        self._schedule_grid_retry()
+
+    def _schedule_grid_retry(self):
+        """Keep every authoritative-read path eligible for prompt grid recovery."""
+        self._next_grid_retry = (
+            None
+            if self._grid_telemetry.snapshot()["_grid_valid"]
+            else time.monotonic() + UNHEALTHY_POLL_INTERVAL
+        )
+
+    def _read_system_snapshot(self):
         generation = self._grid_telemetry.generation
-        output = self._safe_subprocess_tracked(
+        fields, deadline = self._native_reconciliation_read(SYSTEM_SERVICE)
+        if fields is not None:
+            parsed = dict.fromkeys(SYSTEM_SIGNAL_PATHS.values(), 0)
+            parsed.update(
+                {
+                    key: int(value)
+                    for key, value in self._snapshot_numbers(fields, SYSTEM_SIGNAL_PATHS).items()
+                }
+            )
+            parsed["gt"] = parsed["g1"] + parsed["g2"]
+            parsed["tt"] = parsed["t1"] + parsed["t2"]
+            applied_generation = self._grid_telemetry.replace(fields, generation)
+            if applied_generation is not None:
+                self._refresh_grid_meter(applied_generation)
+            self._system_data.update(parsed)
+            self._system_data["_last_update"] = time.time()
+            return
+        output = self._reconciliation_fallback(
             [
                 "dbus-send",
                 "--system",
@@ -909,7 +945,7 @@ class VictronDBus:
                 GET_VALUE_METHOD,
             ],
             service=SYSTEM_SERVICE,
-            timeout=0.5,
+            deadline=deadline,
         )
         if output:
             self._parse_system_data(output, generation)
@@ -930,9 +966,9 @@ class VictronDBus:
         meter = self._grid_telemetry.selected_meter()
         if not meter:
             return
-        fields = self._native.get_values(meter) if self._native is not None else None
+        fields, deadline = self._native_reconciliation_read(meter)
         if not isinstance(fields, dict):
-            output = self._safe_subprocess_tracked(
+            output = self._reconciliation_fallback(
                 [
                     "dbus-send",
                     "--system",
@@ -942,7 +978,7 @@ class VictronDBus:
                     GET_VALUE_METHOD,
                 ],
                 service=meter,
-                timeout=0.5,
+                deadline=deadline,
             )
             fields = parse_grid_meter_snapshot(output) if output else None
         self._grid_telemetry.replace_meter(meter, fields, generation)
@@ -951,7 +987,15 @@ class VictronDBus:
         """Poll bank V/I/P from the SmartShunt service (tree query)."""
         if not self._shunt_service:
             return
-        output = self._safe_subprocess_tracked(
+        fields, deadline = self._native_reconciliation_read(self._shunt_service)
+        if fields is not None:
+            parsed = self._snapshot_numbers(fields, SHUNT_SIGNAL_PATHS)
+            if "bp" in parsed:
+                parsed["bp"] = int(parsed["bp"])
+            self._system_data.update(parsed)
+            self._system_data["_last_update"] = time.time()
+            return
+        output = self._reconciliation_fallback(
             [
                 "dbus-send",
                 "--system",
@@ -961,11 +1005,53 @@ class VictronDBus:
                 GET_VALUE_METHOD,
             ],
             service=self._shunt_service,
-            timeout=0.5,
+            deadline=deadline,
         )
         if output:
             self._system_data.update(parse_shunt_data_output(output))
             self._system_data["_last_update"] = time.time()
+
+    def _native_reconciliation_read(
+        self, service: str, path: str | None = None
+    ) -> tuple[dict | str | None, float | None]:
+        """Reserve half of one 0.5s read budget for CLI; never reconnect here."""
+        if self._native is None or not self._service_healthy(service):
+            return None, None
+        deadline = time.monotonic() + 0.5
+        value = (
+            self._native.get_values_connected(service, timeout=0.25)
+            if path is None
+            else self._native.get_value_connected(service, path, timeout=0.25)
+        )
+        valid = isinstance(value, dict) if path is None else value is not None
+        if valid:
+            self._record_service_success(service)
+            return value, deadline
+        return None, deadline
+
+    def _reconciliation_fallback(
+        self, cmd: list, service: str, deadline: float | None
+    ) -> str | None:
+        """Do not spend another deadline after a native timeout exhausted this read."""
+        timeout = 0.5 if deadline is None else deadline - time.monotonic()
+        if timeout <= 0:
+            if self._service_healthy(service):
+                self._record_service_failure(service)
+            return None
+        return self._safe_subprocess_tracked(cmd, service, timeout)
+
+    @staticmethod
+    def _snapshot_numbers(fields: dict, paths: dict[str, str]) -> dict[str, float]:
+        """Extract finite readings; absent/invalid values are not measured zeroes."""
+        result = {}
+        for path, key in paths.items():
+            try:
+                value = float(fields[path])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                result[key] = value
+        return result
 
     def _read_product_name(self, service: str) -> str:
         """Product name of a battery service ('' when unreadable)."""
@@ -1061,7 +1147,11 @@ class VictronDBus:
             return
 
         for service in BATTERY_CELL_SERVICES:
-            output = self._safe_subprocess_tracked(
+            fields, deadline = self._native_reconciliation_read(service)
+            if fields is not None:
+                self._cache_chain_snapshot(service, fields)
+                continue
+            output = self._reconciliation_fallback(
                 [
                     "dbus-send",
                     "--system",
@@ -1071,7 +1161,7 @@ class VictronDBus:
                     GET_VALUE_METHOD,
                 ],
                 service=service,
-                timeout=0.5,
+                deadline=deadline,
             )
             if not output:
                 continue
@@ -1079,6 +1169,35 @@ class VictronDBus:
             self._parse_and_cache_chain_data(service, output)
 
         self._last_battery_cell_data_time = time.time()
+
+    def _cache_chain_snapshot(self, service: str, fields: dict) -> None:
+        """Cache the same contiguous voltages/sparse temperatures as the CLI tree."""
+        paths = {
+            **{f"/Cell/{i}/Voltage": f"v{i}" for i in range(1, 17)},
+            **{f"/Cell/{i}/Temperature": f"t{i}" for i in range(1, 17)},
+            "/Soc": "soc",
+            "/Info/AllowCharge": "allow_charge",
+            "/Info/AllowDischarge": "allow_discharge",
+        }
+        values = self._snapshot_numbers(fields, paths)
+        voltages = []
+        max_cell = min(self._chain_cell_counts.get(service, 16) + 1, 16)
+        for i in range(1, max_cell + 1):
+            if f"v{i}" not in values:
+                break
+            voltages.append(values[f"v{i}"])
+        if voltages:
+            self._chain_cell_counts[service] = len(voltages)
+        result = self._cached_battery_cell_data.setdefault(service, {})
+        result.update(
+            voltages=voltages,
+            temps=[values[f"t{i}"] for i in range(1, 17) if f"t{i}" in values],
+            soc=values.get("soc"),
+            allow_charge=int(values["allow_charge"]) == 1 if "allow_charge" in values else None,
+            allow_discharge=int(values["allow_discharge"]) == 1
+            if "allow_discharge" in values
+            else None,
+        )
 
     def _parse_and_cache_chain_data(self, service: str, output: str) -> None:
         """Parse tree query output and cache chain data."""
@@ -1180,29 +1299,32 @@ class VictronDBus:
         self._last_inverter_state_time = time.time()
 
     def _poll_inverter_power(self):
-        """Poll inverter power (uses _safe_subprocess directly to avoid lock contention)"""
+        """Reconcile inverter power on the persistent reader, with bounded CLI fallback."""
         if not self._vebus_service:
             return
-
-        output = self._safe_subprocess_tracked(
-            [
-                "dbus-send",
-                "--system",
-                PRINT_REPLY_LITERAL,
-                f"--dest={self._vebus_service}",
-                "/Devices/0/Ac/Inverter/P",
-                GET_VALUE_METHOD,
-            ],
-            service=self._vebus_service,
-            timeout=0.5,
+        output, deadline = self._native_reconciliation_read(
+            self._vebus_service, VEBUS_INV_POWER_PATH
         )
+        if output is None:
+            output = self._reconciliation_fallback(
+                [
+                    "dbus-send",
+                    "--system",
+                    PRINT_REPLY_LITERAL,
+                    f"--dest={self._vebus_service}",
+                    VEBUS_INV_POWER_PATH,
+                    GET_VALUE_METHOD,
+                ],
+                service=self._vebus_service,
+                deadline=deadline,
+            )
         if output:
             try:
                 parts = output.strip().split()
                 if parts:
                     self._system_data["inv_power"] = int(float(parts[-1]))
                     self._consecutive_errors = 0
-            except (ValueError, TypeError) as e:
+            except (ValueError, TypeError, OverflowError) as e:
                 logger.debug("Inverter power parse failed: %s", e)
                 self._consecutive_errors += 1
         else:
@@ -1676,6 +1798,7 @@ class VictronDBus:
         if not output:
             if generation == self._grid_telemetry.generation:
                 self._grid_telemetry.unavailable("System grid read unavailable")
+            self._schedule_grid_retry()
             self._merge_grid_status(data)
             return data
 
@@ -1683,6 +1806,7 @@ class VictronDBus:
         applied_generation = self._grid_telemetry.replace(parse_grid_snapshot(output), generation)
         if applied_generation is not None:
             self._refresh_grid_meter(applied_generation)
+        self._schedule_grid_retry()
         data.update(parsed)
 
         # Bank V/I/P from the SmartShunt only (see SHUNT_SIGNAL_PATHS note).
