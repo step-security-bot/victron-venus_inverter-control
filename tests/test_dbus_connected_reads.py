@@ -49,7 +49,7 @@ def client():
 
     def run():
         native._loop_thread_id = threading.get_ident()
-        ready.set()
+        loop.call_soon(ready.set)
         loop.run_forever()
 
     native._loop = loop
