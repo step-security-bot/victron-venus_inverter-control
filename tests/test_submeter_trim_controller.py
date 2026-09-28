@@ -159,6 +159,7 @@ def test_every_operating_mode_excludes_slow_trim(rig, flag):
 def test_one_shot_precharge_request_blocks_trim(rig):
     rig.warm()
     rig.controller._pre_charge_requested = True
+    rig.controller._pre_charge_expires_at = rig.clock.wall() + 300
     rig.clock.elapsed = 18
     _, flags = rig.controller.calculate_setpoint(rig.snapshot())
     assert not rig.controller._pre_charge_requested
@@ -318,6 +319,7 @@ def test_before_write_edges_cancel_pending_trim(rig, change):
             rig.controller.set_control_flag("no_feed", False)
         elif change == "precharge":
             rig.controller._pre_charge_requested = True
+            rig.controller._pre_charge_expires_at = rig.clock.wall() + 300
         elif change == "manual":
             rig.controller.set_manual_setpoint(-500)
         elif change == "ess":
