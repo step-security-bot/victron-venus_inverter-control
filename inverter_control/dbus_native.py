@@ -15,10 +15,15 @@ Verified against dbus-fast 2.21.1 on Venus OS:
 """
 
 import asyncio
+import hashlib
 import logging
+import marshal
 import os
+import stat
+import sys
 import threading
 import time
+import types
 from collections import deque
 
 logger = logging.getLogger("inverter-control")
@@ -47,6 +52,12 @@ MATCH_TIMEOUT = 1.0
 # while the bus recovers; next call after cooldown reconnects automatically.
 RECONNECT_COOLDOWN = 5.0
 SLOW_SET_TIMING_MS = 200.0
+PROVENANCE_SCHEMA = "dbus-send-provenance-v1"
+PROVENANCE_MRO_LIMIT = 8
+PROVENANCE_MODULE_LIMIT = 8
+PROVENANCE_FILE_LIMIT = 4 * 1024 * 1024
+PROVENANCE_TOTAL_FILE_LIMIT = 8 * 1024 * 1024
+PROVENANCE_RECORD_LIMIT = 32768
 
 # D-Bus signature type codes for the variant types we write.
 TYPE_CODES = {
@@ -58,6 +69,169 @@ TYPE_CODES = {
     "double": "d",
     "string": "s",
 }
+
+
+def _provenance_name(value, limit=256):
+    return value[:limit] if isinstance(value, str) else None
+
+
+def _provenance_type(cls):
+    if not isinstance(cls, type):
+        return None
+    return {
+        "module": _provenance_name(cls.__module__),
+        "qualname": _provenance_name(cls.__qualname__),
+    }
+
+
+def _provenance_code(code):
+    """Background only: fingerprint the captured code object, never its globals."""
+    if not isinstance(code, types.CodeType):
+        return {"status": "no_python_code"}
+    budget = [262144, 4096]
+
+    def bounded(value, depth=0):
+        budget[1] -= 1
+        if depth > 12 or budget[1] < 0:
+            return False
+        if isinstance(value, types.CodeType):
+            return all(
+                bounded(item, depth + 1)
+                for item in (
+                    value.co_code,
+                    value.co_consts,
+                    value.co_names,
+                    value.co_varnames,
+                    value.co_freevars,
+                    value.co_cellvars,
+                    value.co_filename,
+                    value.co_name,
+                    value.co_qualname,
+                    value.co_linetable,
+                    value.co_exceptiontable,
+                )
+            )
+        if isinstance(value, (tuple, frozenset)):
+            return len(value) <= 1024 and all(bounded(item, depth + 1) for item in value)
+        if isinstance(value, (bytes, str)):
+            budget[0] -= len(value) * (4 if isinstance(value, str) else 1)
+        elif isinstance(value, int):
+            budget[0] -= max(1, value.bit_length() // 8 + 1)
+        elif (
+            value is not None and value is not Ellipsis and not isinstance(value, (float, complex))
+        ):
+            return False
+        return budget[0] >= 0
+
+    if not bounded(code):
+        return {"status": "code_budget_exceeded"}
+    encoded = marshal.dumps(code, 4)
+    if len(encoded) > 1024 * 1024:
+        return {"status": "code_budget_exceeded"}
+    return {
+        "status": "captured_python_code",
+        "format": "python-marshal-v4-sha256",
+        "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _provenance_module(name, budget):
+    """Background only; a current file hash is not proof of loaded binary bytes."""
+    result = {"module": name, "file": None, "spec_origin": None}
+    allowed = name in {"builtins", "_asyncio", "inverter_control.dbus_native"} or name.startswith(
+        ("dbus_fast.", "asyncio.")
+    )
+    if not allowed:
+        return {**result, "status": "module_not_allowlisted"}
+    module = sys.modules.get(name)
+    if module is None:
+        return {**result, "status": "module_not_loaded"}
+    path = getattr(module, "__file__", None)
+    result["file"] = _provenance_name(path, 512)
+    result["spec_origin"] = _provenance_name(
+        getattr(getattr(module, "__spec__", None), "origin", None), 512
+    )
+    if not isinstance(path, str) or len(path) > 512:
+        return {**result, "status": "no_bounded_file_path"}
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            return {**result, "status": "not_regular_file"}
+        if before.st_size > min(PROVENANCE_FILE_LIMIT, budget[0]):
+            return {**result, "status": "file_budget_exceeded"}
+        hasher = hashlib.sha256()
+        size = 0
+        while size < before.st_size:
+            block = os.read(fd, min(65536, before.st_size - size))
+            if not block:
+                break
+            size += len(block)
+            budget[0] -= len(block)
+            hasher.update(block)
+        after = os.fstat(fd)
+        if size != before.st_size or (before.st_size, before.st_mtime_ns) != (
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            return {**result, "status": "file_changed_during_read"}
+        return {
+            **result,
+            "status": "current_file_hashed",
+            "bytes": size,
+            "current_file_sha256": hasher.hexdigest(),
+            "loaded_bytes_verified": False,
+        }
+    except OSError as error:
+        return {**result, "status": "file_unavailable", "error_type": type(error).__name__}
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _serialize_send_provenance(refs):
+    """Called only by the existing background timing drain, outside its lock."""
+    record = {
+        "phase": "writer_provenance",
+        "schema": PROVENANCE_SCHEMA,
+        "clock": "monotonic",
+        "observed_at": refs["observed_at"],
+        "pid": refs["pid"],
+        "loop_native_tid": refs["loop_native_tid"],
+        "sender": _provenance_name(refs["sender"], 128),
+        "send_returned": refs["send_returned"],
+        "underlying_send": {
+            "module": _provenance_name(refs["send_module"]),
+            "qualname": _provenance_name(refs["send_qualname"]),
+            "bound_callable_type": _provenance_type(refs["send_type"]),
+            "code": _provenance_code(refs["send_code"]),
+        },
+    }
+    modules = []
+    if record["underlying_send"]["module"]:
+        modules.append(record["underlying_send"]["module"])
+    for role in ("bus", "writer", "future"):
+        mro = [_provenance_type(cls) for cls in refs[role + "_mro"]]
+        record[role] = {
+            "class": mro[0] if mro else None,
+            "mro": mro,
+            "mro_truncated": refs[role + "_truncated"],
+        }
+        for descriptor in mro:
+            if descriptor and descriptor["module"] and descriptor["module"] not in modules:
+                modules.append(descriptor["module"])
+    budget = [PROVENANCE_TOTAL_FILE_LIMIT]
+    record["modules"] = [
+        _provenance_module(name, budget) for name in modules[:PROVENANCE_MODULE_LIMIT]
+    ]
+    record["modules_truncated"] = len(modules) > PROVENANCE_MODULE_LIMIT
+    # The existing sink logs dict repr, not JSON. Enforce its actual payload
+    # bound after serialization, including UTF-8 expansion and escaping.
+    if len(repr(record).encode("utf-8")) > PROVENANCE_RECORD_LIMIT:
+        raise ValueError("provenance record budget exceeded")
+    return record
 
 
 class _SendObservation:
@@ -115,6 +289,8 @@ class _SendTimingBusMixin:
         self._send_observations = {}
         self._send_observers_closed = False
         self._send_observer_loop = asyncio.get_running_loop()
+        self._send_provenance_sink = None
+        self._send_provenance_taken = False
         super().__init__(*args, **kwargs)
 
     def observe_send(self, message, timing):
@@ -134,6 +310,7 @@ class _SendTimingBusMixin:
 
         def clear():
             self._send_observers_closed = True
+            self._send_provenance_sink = None
             observations = tuple(self._send_observations.values())
             self._send_observations.clear()
             for _, observation in observations:
@@ -147,17 +324,69 @@ class _SendTimingBusMixin:
         else:
             clear()
 
+    def _take_send_provenance(self, underlying_send):
+        """Writer loop: retain bounded type/code refs, never instances or file I/O."""
+        try:
+            if getattr(self, "_send_provenance_taken", False) or not getattr(
+                self, "_send_provenance_sink", None
+            ):
+                return None
+            self._send_provenance_taken = True
+            refs = {
+                "observed_at": time.monotonic(),
+                "pid": os.getpid(),
+                "loop_native_tid": threading.get_native_id(),
+                "sender": self.unique_name,
+                "send_module": getattr(underlying_send, "__module__", None),
+                "send_qualname": getattr(underlying_send, "__qualname__", None),
+                "send_type": type(underlying_send),
+                # Capture before invoking this exact bound callable. A later
+                # reassignment of function.__code__ must not revise evidence.
+                "send_code": getattr(underlying_send, "__code__", None),
+            }
+            for role, cls in (("bus", type(self)), ("writer", type(self._writer))):
+                mro = cls.__mro__
+                refs[role + "_mro"] = mro[:PROVENANCE_MRO_LIMIT]
+                refs[role + "_truncated"] = len(mro) > PROVENANCE_MRO_LIMIT
+            return refs
+        except Exception:
+            # Missing optional provenance must never prevent the original send.
+            return None
+
+    def _finish_send_provenance(self, refs, future, returned):
+        if refs is None:
+            return
+        try:
+            mro = type(future).__mro__ if returned else ()
+            refs["future_mro"] = mro[:PROVENANCE_MRO_LIMIT]
+            refs["future_truncated"] = len(mro) > PROVENANCE_MRO_LIMIT
+            refs["send_returned"] = returned
+            sink = self._send_provenance_sink
+            if sink is not None:
+                sink(refs)
+        except Exception:
+            # Diagnostics cannot replace the original transport result/error.
+            pass
+
     def send(self, message):
         entry = self._send_observations.get(id(message))
         observation = entry[1] if entry is not None and entry[0] is message else None
+        underlying_send = super().send
+        refs = self._take_send_provenance(underlying_send) if observation is not None else None
         if observation is not None:
             observation.started()
         # Call the original transport once and return the very same Future.
         # In dbus-fast 2.21.1, this may write synchronously before returning.
-        future = super().send(message)
-        if observation is not None:
-            observation.returned(future)
-        return future
+        future = None
+        returned = False
+        try:
+            future = underlying_send(message)
+            returned = True
+            if observation is not None:
+                observation.returned(future)
+            return future
+        finally:
+            self._finish_send_provenance(refs, future, returned)
 
 
 class NativeDbusClient:
@@ -203,6 +432,8 @@ class NativeDbusClient:
         # Bounded diagnostics only. The performance worker drains these; no
         # logging or exporter I/O runs while a write caller waits for its ACK.
         self._write_timings = deque(maxlen=64)
+        self._send_provenance = deque(maxlen=4)
+        self._send_provenance_closed = False
         self._write_timings_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
@@ -348,11 +579,28 @@ class NativeDbusClient:
         finally:
             self._write_timings_lock.release()
 
+    def _queue_send_provenance(self, refs):
+        if not self._write_timings_lock.acquire(blocking=False):
+            return
+        try:
+            if not self._send_provenance_closed:
+                self._send_provenance.append(refs)
+        finally:
+            self._write_timings_lock.release()
+
     def drain_write_timings(self) -> list[dict]:
         """Take slow-write diagnostics for a background sink; contains no values."""
         with self._write_timings_lock:
             samples = list(self._write_timings)
             self._write_timings.clear()
+            provenance = list(self._send_provenance)
+            self._send_provenance.clear()
+        for refs in provenance:
+            try:
+                samples.append(_serialize_send_provenance(refs))
+            except Exception:
+                # A failed background diagnostic must not disrupt the sink.
+                pass
         return samples
 
     async def _call_message(self, bus, message, *, timing=None):
@@ -446,6 +694,8 @@ class NativeDbusClient:
         async def _connect_data():
             bus = await bus_type(bus_address=SYSTEM_BUS_ADDRESS).connect()
             bus.add_message_handler(self._handle_message)
+            if self._observe_write_send:
+                bus._send_provenance_sink = self._queue_send_provenance
             return bus
 
         self._stop_send_observations(self._bus)
@@ -594,6 +844,9 @@ class NativeDbusClient:
 
     def close(self):
         """Stop the event-loop thread and release the connection."""
+        with self._write_timings_lock:
+            self._send_provenance_closed = True
+            self._send_provenance.clear()
         with self._state_lock:
             self._stop_send_observations(self._bus)
             bus, self._bus = self._bus, None
