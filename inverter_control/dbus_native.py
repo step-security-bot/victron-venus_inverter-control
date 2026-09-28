@@ -60,6 +60,103 @@ TYPE_CODES = {
 }
 
 
+class _SendObservation:
+    """Observe a send Future without awaiting, cancelling or consuming its result."""
+
+    def __init__(self, timing):
+        self.timing = timing
+        self.active = True
+        self.future = None
+
+    def started(self):
+        try:
+            self.timing["send_started_at"] = time.monotonic()
+        except Exception:
+            pass
+
+    def returned(self, future):
+        try:
+            self.timing["send_returned_at"] = time.monotonic()
+            if not isinstance(future, asyncio.Future):
+                return
+            self.future = future
+            if future.done():
+                self._done(future)
+            else:
+                future.add_done_callback(self._done)
+        except Exception:
+            pass
+
+    def _done(self, future):
+        if not self.active:
+            return
+        try:
+            self.timing["send_done_observed_at"] = time.monotonic()
+            self.timing["send_future_cancelled"] = future.cancelled()
+            # Do not call result()/exception(): observation must neither
+            # consume an error nor mistake Future completion for an ACK.
+        except Exception:
+            pass
+
+    def close(self):
+        self.active = False
+        if self.future is not None:
+            self.future.remove_done_callback(self._done)
+            self.future = None
+
+
+class _SendTimingBusMixin:
+    """Opt-in on the writer only; public send/call retain their normal semantics."""
+
+    def __init__(self, *args, **kwargs):
+        self._send_observations = {}
+        self._send_observers_closed = False
+        self._send_observer_loop = asyncio.get_running_loop()
+        super().__init__(*args, **kwargs)
+
+    def observe_send(self, message, timing):
+        if self._send_observers_closed:
+            return None
+        observation = _SendObservation(timing)
+        self._send_observations[id(message)] = (message, observation)
+
+        def stop():
+            self._send_observations.pop(id(message), None)
+            observation.close()
+
+        return stop
+
+    def stop_observing_sends(self):
+        """Release only diagnostics, on their original loop before it stops."""
+
+        def clear():
+            self._send_observers_closed = True
+            observations = tuple(self._send_observations.values())
+            self._send_observations.clear()
+            for _, observation in observations:
+                observation.close()
+
+        loop = self._send_observer_loop
+        if loop.is_running():
+            # Native close queues this before loop.stop, including when a
+            # failed connection has already been dropped from client._bus.
+            loop.call_soon_threadsafe(clear)
+        else:
+            clear()
+
+    def send(self, message):
+        entry = self._send_observations.get(id(message))
+        observation = entry[1] if entry is not None and entry[0] is message else None
+        if observation is not None:
+            observation.started()
+        # Call the original transport once and return the very same Future.
+        # In dbus-fast 2.21.1, this may write synchronously before returning.
+        future = super().send(message)
+        if observation is not None:
+            observation.returned(future)
+        return future
+
+
 class NativeDbusClient:
     """
     Persistent system-bus connection over dbus_fast with its own event loop.
@@ -69,7 +166,8 @@ class NativeDbusClient:
     writes never block each other on a lock.
     """
 
-    def __init__(self):
+    def __init__(self, *, observe_write_send=False):
+        self._observe_write_send = observe_write_send
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread_id: int | None = None
         self._bus = None
@@ -210,6 +308,9 @@ class NativeDbusClient:
                 "dispatched_at",
                 "await_started_at",
                 "call_started_at",
+                "send_started_at",
+                "send_returned_at",
+                "send_done_observed_at",
                 "reply_observed_at",
                 "call_finished_at",
                 "completed_at",
@@ -232,6 +333,9 @@ class NativeDbusClient:
             "caller_wakeup_ms": elapsed("completed_at", "returned_at"),
             "call_to_reply_observer_ms": elapsed("call_started_at", "reply_observed_at"),
             "reply_observer_to_resume_ms": elapsed("reply_observed_at", "call_finished_at"),
+            "send_sync_ms": elapsed("send_started_at", "send_returned_at"),
+            "send_return_to_done_observer_ms": elapsed("send_returned_at", "send_done_observed_at"),
+            "send_future_cancelled": sampled.get("send_future_cancelled"),
         }
         # A background sink must never delay the synchronous write caller.
         if not self._write_timings_lock.acquire(blocking=False):
@@ -251,7 +355,13 @@ class NativeDbusClient:
     async def _call_message(self, bus, message, *, timing=None):
         """Call once, observing replies without consuming them or replacing call()."""
         observer = None
+        stop_send_observer = None
         if timing is not None:
+            if self._observe_write_send:
+                try:
+                    stop_send_observer = bus.observe_send(message, timing)
+                except Exception:
+                    pass
 
             def observe_reply(reply):
                 # Public user-space receive hook, BEFORE dbus-fast resolves its
@@ -275,6 +385,11 @@ class NativeDbusClient:
         finally:
             if timing is not None:
                 timing["call_finished_at"] = time.monotonic()
+            if stop_send_observer is not None:
+                try:
+                    stop_send_observer()
+                except Exception:
+                    pass
             if observer is not None:
                 try:
                     bus.remove_message_handler(observer)
@@ -315,11 +430,20 @@ class NativeDbusClient:
     def _connect(self):
         from dbus_fast.aio.message_bus import MessageBus
 
+        bus_type = MessageBus
+        if self._observe_write_send:
+
+            class SendTimingBus(_SendTimingBusMixin, MessageBus):
+                pass
+
+            bus_type = SendTimingBus
+
         async def _connect_data():
-            bus = await MessageBus(bus_address=SYSTEM_BUS_ADDRESS).connect()
+            bus = await bus_type(bus_address=SYSTEM_BUS_ADDRESS).connect()
             bus.add_message_handler(self._handle_message)
             return bus
 
+        self._stop_send_observations(self._bus)
         self._loop = self._ensure_loop()
         self._bus = self._call_on_loop(_connect_data, CONNECT_TIMEOUT)
         if self._bus is None or not getattr(self._bus, "connected", True):
@@ -422,8 +546,18 @@ class NativeDbusClient:
             except Exception as e:  # pylint: disable=broad-exception-caught
                 logger.debug("Native D-Bus connect failed (%s): %s", type(e).__name__, e)
                 self._fail_until = time.time() + RECONNECT_COOLDOWN
+                self._stop_send_observations(self._bus)
                 self._bus = None
                 return None
+
+    @staticmethod
+    def _stop_send_observations(bus):
+        if isinstance(bus, _SendTimingBusMixin):
+            try:
+                bus.stop_observing_sends()
+            except Exception:
+                # Optional diagnostics cannot change connection teardown.
+                pass
 
     def _try_disconnect(self, bus, loop) -> None:
         """Best-effort, bounded bus disconnect that never raises.
@@ -445,6 +579,7 @@ class NativeDbusClient:
     def _mark_failure(self, failed_bus):
         """Drop only the connection that failed, never a newer replacement."""
         with self._state_lock:
+            self._stop_send_observations(failed_bus)
             if self._bus is not failed_bus:
                 return
             self._fail_until = time.time() + RECONNECT_COOLDOWN
@@ -455,6 +590,7 @@ class NativeDbusClient:
     def close(self):
         """Stop the event-loop thread and release the connection."""
         with self._state_lock:
+            self._stop_send_observations(self._bus)
             bus, self._bus = self._bus, None
             self._fail_until = float("inf")
             loop, self._loop = self._loop, None
