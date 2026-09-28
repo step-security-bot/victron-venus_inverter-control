@@ -59,6 +59,7 @@ def _make_controller(**overrides):
         patch(f"{_MOD}.ConsoleUI") as mock_console_cls,
         patch(f"{_MOD}.SetpointCalculator") as mock_calc_cls,
         patch(f"{_MOD}.EvChargerReader") as mock_evcharger_cls,
+        patch(f"{_MOD}.get_webhook_server"),
         patch("inverter_control.config.get_ui_config", return_value=overrides.get("ui_config", {})),
         patch(f"{_MOD}.DRY_RUN", False),
         patch(f"{_MOD}.LOOP_INTERVAL", 0.33),
@@ -743,6 +744,97 @@ class TestSetPowerLimits(unittest.TestCase):
         result = controller.set_power_limits(-5000, 5000)
         assert result["min"] == -3000
         assert result["max"] == 3000
+
+    def test_clamps_both_endpoints_for_ranges_outside_absolute_limits(self):
+        controller, _, _, _ = _make_controller()
+        for limits, expected in (
+            ((4000, 5000), {"min": 3000, "max": 3000}),
+            ((-5000, -4000), {"min": -3000, "max": -3000}),
+        ):
+            assert controller.set_power_limits(*limits) == expected
+
+    def test_invalid_limits_preserve_active_range_and_calculator(self):
+        controller, _, _, calculator = _make_controller()
+        generation = controller._trim_mode_generation
+        for limits in ((1000, -1000), (True, 1000), (-1000, 1.5), ("0", 1000)):
+            with pytest.raises(ValueError):
+                controller.set_power_limits(*limits)
+            assert (controller.power_limit_min, controller.power_limit_max) == (-2300, 2250)
+            assert (calculator.power_limit_min, calculator.power_limit_max) == (-2300, 2250)
+            assert controller._trim_mode_generation == generation
+
+
+@pytest.mark.parametrize("previous,expected", [(5000, 2250), (-5000, -2300)])
+def test_stop_override_resumes_with_a_bounded_automatic_write(previous, expected):
+    from inverter_control.logic import SetpointCalculator
+
+    controller, victron, ha, _ = _make_controller()
+    controller.calculator = SetpointCalculator({})
+    controller.grid_filter = None
+    controller.derived_grid_filter = None
+    system = dict.fromkeys(("g1", "g2", "gt", "t1", "t2", "tt", "bv", "bc", "bp"), 0)
+    system["_grid_valid"] = True
+    victron.get_system_data.return_value = system
+    victron.get_grid_status.return_value = system
+    victron.get_mppt_data.return_value = {}
+    victron.get_pv_power.return_value = []
+    victron.get_inverter_power.return_value = 0
+    victron.set_grid_setpoint.return_value = True
+    ha.get_vue_sensor.return_value = 0
+    controller.set_setpoint_override(previous)
+    controller.set_setpoint_override(None)
+    victron.set_grid_setpoint.reset_mock()
+    with patch.object(controller, "update_state"), patch(f"{_MOD}.broadcast_line"):
+        assert controller.run_cycle()
+    victron.set_grid_setpoint.assert_called_once_with(expected)
+    assert controller.previous_setpoint == expected
+
+
+def test_limit_edit_before_write_constrains_a_calculated_command():
+    controller, victron, _, calculator = _make_controller()
+    system = dict.fromkeys(("g1", "g2", "gt", "t1", "t2", "tt"), 0)
+    system["_grid_valid"] = True
+    victron.get_system_data.return_value = system
+    victron.get_mppt_data.return_value = {}
+    victron.get_pv_power.return_value = []
+    calculator.calculate.return_value = MagicMock(setpoint=2000, flags="", filtered_gt=0)
+    victron.set_grid_setpoint.return_value = True
+
+    def edit_limits_before_write():
+        controller.set_power_limits(-1000, 1000)
+        return system
+
+    victron.get_grid_status.side_effect = edit_limits_before_write
+    with patch.object(controller, "update_state"), patch(f"{_MOD}.broadcast_line"):
+        assert controller.run_cycle()
+    victron.set_grid_setpoint.assert_called_once_with(1000)
+    assert controller.previous_setpoint == 1000
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        ({"min": True, "max": 1000}, (-2300, 2250)),
+        ({"min": -1000, "max": 1.5}, (-2300, 2250)),
+        ({"min": 1000, "max": -1000}, (-2300, 2250)),
+        ({"min": -1000, "max": float("inf")}, (-2300, 2250)),
+        ({"min": "-1000", "max": "1000"}, (-1000, 1000)),
+        ({"min": -1000.0, "max": 1000.0}, (-1000, 1000)),
+    ],
+)
+def test_mqtt_limits_preserve_integer_client_compatibility(payload, expected):
+    controller, victron, _, _ = _make_controller()
+    bridge = MagicMock()
+    with (
+        patch("main.MQTT_AVAILABLE", True),
+        patch("inverter_control.config.MQTT_BROKER", "test-broker"),
+        patch("main.get_mqtt_bridge", return_value=bridge),
+    ):
+        main._setup_mqtt_bridge(controller)
+    callbacks = dict(call.args for call in bridge.register_callback.call_args_list)
+    callbacks["limits"](payload)
+    assert (controller.power_limit_min, controller.power_limit_max) == expected
+    victron.set_grid_setpoint.assert_not_called()
 
 
 class TestToggleDryRun(unittest.TestCase):
