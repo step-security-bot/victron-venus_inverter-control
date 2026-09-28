@@ -122,7 +122,7 @@ class NativeDbusClient:
         self._loop = loop
         return loop
 
-    def _call_on_loop(self, async_fn, timeout: float, *, timing=None):
+    def _call_on_loop(self, async_fn, timeout: float, *, timing=None, existing_loop=None):
         """Run a coroutine factory on the loop, cross-thread safe.
 
         Submits ``async_fn()`` onto the dedicated event-loop thread and waits up
@@ -133,8 +133,11 @@ class NativeDbusClient:
         Failures propagate so the caller can distinguish a request deadline
         from a broken shared connection.
         """
-        if self._loop is None:
-            self._ensure_loop()
+        loop = existing_loop
+        if loop is None:
+            if self._loop is None:
+                self._ensure_loop()
+            loop = self._loop
         if self._loop_thread_id == threading.get_ident():
             # Already on the loop thread. It is running (run_forever), so a
             # synchronous wait is impossible here. Do not schedule a command
@@ -165,7 +168,7 @@ class NativeDbusClient:
         try:
             if timing is not None:
                 timing["submitted_at"] = time.monotonic()
-            future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
         except BaseException as error:
             coroutine.close()
             if isinstance(error, RuntimeError):
@@ -562,6 +565,73 @@ class NativeDbusClient:
     def get_values(self, service: str, timeout: float = 0.5) -> dict[str, str | None] | None:
         """Read one root BusItem snapshot so related fields share a reply."""
         reply = self.call_busitem(service, "/", "GetValue", timeout=timeout)
+        return self._format_tree_reply(reply)
+
+    def _read_connected(self, service: str, path: str, timeout: float):
+        """Read only the captured live connection; never reconnect or wait on its lock.
+
+        Reconciliation reserves time for a CLI fallback. Connection setup and
+        subscription replay must not consume that request budget, including
+        when another thread disconnects or reconnects between check and use.
+        """
+        deadline = time.monotonic() + timeout
+        if (
+            not _DBUS_FAST_AVAILABLE
+            or self._loop_thread_id == threading.get_ident()
+            or not self._state_lock.acquire(blocking=False)
+        ):
+            return None
+        try:
+            bus, loop = self._bus, self._loop
+            if (
+                bus is None
+                or not getattr(bus, "connected", True)
+                or loop is None
+                or not loop.is_running()
+                or time.time() < self._fail_until
+            ):
+                return None
+        finally:
+            self._state_lock.release()
+        from dbus_fast import Message
+
+        try:
+            message = Message(
+                destination=service, path=path, interface=BUSITEM_INTERFACE, member="GetValue"
+            )
+
+            async def read():
+                if self._bus is not bus or self._loop is not loop or not bus.connected:
+                    return None
+                return await self._call_message(bus, message)
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            reply = self._call_on_loop(read, remaining, existing_loop=loop)
+        except Exception:
+            # No _mark_failure here: it can wait behind a concurrent reconnect.
+            # Normal connection management owns repair; this read just falls back.
+            return None
+        return (
+            reply if reply is not None and reply.message_type == MessageType.METHOD_RETURN else None
+        )
+
+    def get_value_connected(self, service: str, path: str, timeout: float = 0.25) -> str | None:
+        """Bounded read on an existing connection, without connection setup or repair."""
+        reply = self._read_connected(service, path, timeout)
+        if reply is None or not reply.body:
+            return None
+        return _format_value(getattr(reply.body[0], "value", None))
+
+    def get_values_connected(
+        self, service: str, timeout: float = 0.25
+    ) -> dict[str, str | None] | None:
+        """Coherent root snapshot using only an already-connected reader."""
+        return self._format_tree_reply(self._read_connected(service, "/", timeout))
+
+    @staticmethod
+    def _format_tree_reply(reply) -> dict[str, str | None] | None:
         if reply is None or not reply.body:
             return None
         values = getattr(reply.body[0], "value", reply.body[0])
