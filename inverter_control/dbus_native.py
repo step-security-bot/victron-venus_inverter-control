@@ -146,6 +146,7 @@ class NativeDbusClient:
         async def _run():
             if timing is not None:
                 timing["dispatched_at"] = time.monotonic()
+                timing["loop_native_tid"] = threading.get_native_id()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 # A busy loop must not send an old queued setpoint after the
@@ -198,7 +199,27 @@ class NativeDbusClient:
                 return None
             return round((b - a) * 1000.0, 3)
 
+        anchors = {
+            key: sampled.get(key)
+            for key in (
+                "started_at",
+                "submitted_at",
+                "dispatched_at",
+                "await_started_at",
+                "call_started_at",
+                "reply_observed_at",
+                "call_finished_at",
+                "completed_at",
+                "returned_at",
+            )
+        }
         sample = {
+            "phase": "native_call",
+            "clock": "monotonic",
+            "pid": os.getpid(),
+            "caller_native_tid": sampled.get("caller_native_tid"),
+            "loop_native_tid": sampled.get("loop_native_tid"),
+            "anchors": anchors,
             "sender": getattr(bus, "unique_name", None),
             "serial": message.serial or None,
             "total_ms": round(total_ms, 3),
@@ -206,9 +227,16 @@ class NativeDbusClient:
             "dispatch_ms": elapsed("submitted_at", "dispatched_at"),
             "await_reply_ms": elapsed("await_started_at", "completed_at"),
             "caller_wakeup_ms": elapsed("completed_at", "returned_at"),
+            "call_to_reply_observer_ms": elapsed("call_started_at", "reply_observed_at"),
+            "reply_observer_to_resume_ms": elapsed("reply_observed_at", "call_finished_at"),
         }
-        with self._write_timings_lock:
+        # A background sink must never delay the synchronous write caller.
+        if not self._write_timings_lock.acquire(blocking=False):
+            return
+        try:
             self._write_timings.append(sample)
+        finally:
+            self._write_timings_lock.release()
 
     def drain_write_timings(self) -> list[dict]:
         """Take slow-write diagnostics for a background sink; contains no values."""
@@ -217,11 +245,38 @@ class NativeDbusClient:
             self._write_timings.clear()
         return samples
 
-    async def _call_message(self, bus, message):
-        """Call one message and release its reply handler, including on timeout."""
+    async def _call_message(self, bus, message, *, timing=None):
+        """Call once, observing replies without consuming them or replacing call()."""
+        observer = None
+        if timing is not None:
+
+            def observe_reply(reply):
+                # Public user-space receive hook, BEFORE dbus-fast resolves its
+                # pending future. Never consume a message or inspect its body.
+                if (
+                    message.serial
+                    and reply.reply_serial == message.serial
+                    and reply.message_type in (MessageType.METHOD_RETURN, MessageType.ERROR)
+                    and "reply_observed_at" not in timing
+                ):
+                    timing["reply_observed_at"] = time.monotonic()
+
+            try:
+                bus.add_message_handler(observe_reply)
+                observer = observe_reply
+            except Exception:  # Diagnostics must not prevent a confirmed write.
+                pass
+            timing["call_started_at"] = time.monotonic()
         try:
             return await bus.call(message)
         finally:
+            if timing is not None:
+                timing["call_finished_at"] = time.monotonic()
+            if observer is not None:
+                try:
+                    bus.remove_message_handler(observer)
+                except Exception:
+                    pass
             # dbus-fast 2.21.1 leaves cancelled calls in this public Cython dict
             # until a reply/disconnect. A silent endpoint must not leak one
             # handler per retry on the otherwise healthy shared connection.
@@ -440,14 +495,18 @@ class NativeDbusClient:
             logger.debug("Invalid native D-Bus request %s %s/%s: %s", service, member, path, e)
             return None
 
-        timing = {"started_at": time.monotonic()} if member == "SetValue" else None
+        timing = (
+            {"started_at": time.monotonic(), "caller_native_tid": threading.get_native_id()}
+            if member == "SetValue"
+            else None
+        )
         bus = self._get_bus()
         if bus is None:
             return None
         try:
 
             def _call():
-                return self._call_message(bus, message)
+                return self._call_message(bus, message, timing=timing)
 
             if timing is None:
                 reply = self._call_on_loop(_call, timeout)

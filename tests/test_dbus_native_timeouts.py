@@ -1,6 +1,7 @@
 """Request deadlines must not tear down a healthy shared native connection."""
 
 import asyncio
+import os
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -24,10 +25,22 @@ def test_write_timing_partitions_phases_and_keeps_only_correlation_fields(native
         "await_started_at": 10.12,
         "completed_at": 10.25,
         "returned_at": 10.30,
+        "call_started_at": 10.125,
+        "reply_observed_at": 10.20,
+        "call_finished_at": 10.24,
+        "caller_native_tid": 321,
+        "loop_native_tid": 654,
+        "command_body": "never copy this",
     }
     native._record_write_timing(timing, native._bus, message)
     assert native.drain_write_timings() == [
         {
+            "phase": "native_call",
+            "clock": "monotonic",
+            "pid": os.getpid(),
+            "caller_native_tid": 321,
+            "loop_native_tid": 654,
+            "anchors": {key: value for key, value in timing.items() if key.endswith("_at")},
             "sender": ":1.42",
             "serial": 7,
             "total_ms": 300.0,
@@ -35,6 +48,8 @@ def test_write_timing_partitions_phases_and_keeps_only_correlation_fields(native
             "dispatch_ms": 100.0,
             "await_reply_ms": 130.0,
             "caller_wakeup_ms": 50.0,
+            "call_to_reply_observer_ms": 75.0,
+            "reply_observer_to_resume_ms": 40.0,
         }
     ]
     assert native.drain_write_timings() == []
@@ -52,8 +67,22 @@ def test_slow_write_diagnostics_are_bounded_and_do_not_log_in_caller(native):
     samples = native.drain_write_timings()
     assert len(samples) == 64
     assert [x["serial"] for x in samples] == list(range(7, 71))
+
+    async def loop_tid():
+        return threading.get_native_id()
+
+    native_tid = asyncio.run_coroutine_threadsafe(loop_tid(), native._loop).result(1)
     for sample in samples:
+        assert sample["caller_native_tid"] == threading.get_native_id()
+        assert sample["loop_native_tid"] == native_tid
+        assert native_tid != threading.get_native_id()
         assert set(sample) == {
+            "phase",
+            "clock",
+            "pid",
+            "caller_native_tid",
+            "loop_native_tid",
+            "anchors",
             "sender",
             "serial",
             "total_ms",
@@ -61,8 +90,12 @@ def test_slow_write_diagnostics_are_bounded_and_do_not_log_in_caller(native):
             "dispatch_ms",
             "await_reply_ms",
             "caller_wakeup_ms",
+            "call_to_reply_observer_ms",
+            "reply_observer_to_resume_ms",
         }
-        assert all(value >= 0 for key, value in sample.items() if key.endswith("_ms"))
+        assert all(
+            value >= 0 for key, value in sample.items() if key.endswith("_ms") and value is not None
+        )
     assert not native.drain_write_timings()
 
 

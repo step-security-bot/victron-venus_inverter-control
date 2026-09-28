@@ -7,10 +7,12 @@ Fast D-Bus access for grid control and monitoring
 import json
 import logging
 import math
+import os
 import re
 import subprocess
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any
@@ -27,7 +29,7 @@ from .config import (
     USE_NATIVE_DBUS,
 )
 from .control_flags import CONTROL_FLAG_KEYS
-from .dbus_native import NativeDbusClient
+from .dbus_native import SLOW_SET_TIMING_MS, NativeDbusClient
 from .grid_backup import GridBackup, parse_backup_snapshot
 from .grid_telemetry import (
     GRID_PATHS,
@@ -183,6 +185,8 @@ class VictronDBus:
         # Setpoint writes get their own lock so a telemetry read holding
         # _dbus_lock can never delay the control-loop write path.
         self._set_lock = threading.Lock()
+        self._write_lock_timings = deque(maxlen=64)
+        self._write_lock_timings_lock = threading.Lock()
         # Serializes background service discovery (startup, NameOwnerChanged on
         # the native signal thread, and the poll-thread rescan can otherwise
         # run overlapping `dbus -y` subprocesses and race the service maps).
@@ -396,8 +400,35 @@ class VictronDBus:
         return self._signals_healthy()
 
     def drain_write_timings(self) -> list[dict]:
-        """Collect native diagnostics without reading or controlling devices."""
-        return self._native_write.drain_write_timings() if self._native_write is not None else []
+        """Collect bounded diagnostics without reading or controlling devices."""
+        samples = (
+            list(self._native_write.drain_write_timings()) if self._native_write is not None else []
+        )
+        with self._write_lock_timings_lock:
+            samples.extend(self._write_lock_timings)
+            self._write_lock_timings.clear()
+        return samples
+
+    def _record_write_lock_timing(self, requested: float, acquired: float) -> None:
+        wait_ms = (acquired - requested) * 1000.0
+        if wait_ms < SLOW_SET_TIMING_MS:
+            return
+        sample = {
+            "phase": "write_lock",
+            "clock": "monotonic",
+            "pid": os.getpid(),
+            "caller_native_tid": threading.get_native_id(),
+            "anchors": {"lock_requested_at": requested, "lock_acquired_at": acquired},
+            "lock_wait_ms": round(wait_ms, 3),
+        }
+        # The performance worker may be descheduled while draining. Never
+        # delay a control write for optional diagnostics; losing a sample is OK.
+        if not self._write_lock_timings_lock.acquire(blocking=False):
+            return
+        try:
+            self._write_lock_timings.append(sample)
+        finally:
+            self._write_lock_timings_lock.release()
 
     def close(self) -> None:
         """Request polling stop, wait briefly, and close both native clients."""
@@ -1542,7 +1573,9 @@ class VictronDBus:
         overwritten by an older caller's delayed CLI fallback."""
 
         native_failed = False
+        lock_requested = time.monotonic()
         with self._set_lock:
+            self._record_write_lock_timing(lock_requested, time.monotonic())
             if self._native_write is not None:
                 ok = self._native_write.set_value(service, path, value, value_type)
                 if ok:
