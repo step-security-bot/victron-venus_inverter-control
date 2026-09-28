@@ -112,3 +112,64 @@ For hardware acceptance, collect a bounded passive window after identifying the
 installed source. Preserve current control flags and watchdog limits. Report
 deadline and write-error counter deltas alongside paired request traces. This
 diagnostic change does not establish a real-time deadline guarantee.
+
+## Writer implementation provenance
+
+The first observed send on each opt-in writer connection also attempts one
+`phase: writer_provenance`, `schema: dbus-send-provenance-v1` record. This uses the
+existing background timing sink and its log prefix. It is a separate schema, not
+a native duration sample; existing strict timing parsers should reject it and a
+consumer must dispatch this phase to a dedicated provenance parser.
+
+Before invoking the exact bound underlying `super().send` once, the writer loop
+captures its module/name, callable type and available `__code__` reference,
+plus the bus and internal writer class references. After the original invocation
+returns, it captures the actual returned Future class. It returns the same object
+and does not await, cancel or retrieve its result. An original exception still
+propagates; the record then has `send_returned: false` and no Future class.
+`observed_at` is a monotonic capture timestamp; PID, loop native TID and D-Bus unique
+sender identify the running process/connection. No message, body, command value,
+destination or command path enters the provenance record.
+
+This one-time capture adds small diagnostic work around the first observed send;
+it is not evidence of improved physical latency. Class MROs are capped at eight
+entries. The capture stores bounded type/code references, not bus, message, Future
+instances or the bound method. It does not hash, import or read files. Enqueueing
+uses a nonblocking lock and at most four pending records; contention drops the
+record without retrying that connection. Reconnection can produce a new record.
+Draining releases references, overflow drops the oldest record, and client close
+clears pending records and rejects late enqueueing from an in-progress send.
+
+Only the background drain, after releasing the queue lock, serializes those
+references. The record has exactly these top-level fields: `phase`, `schema`,
+`clock`, `observed_at`, `pid`, `loop_native_tid`, `sender`, `send_returned`,
+`underlying_send`, `bus`, `writer`, `future`, `modules`, `modules_truncated`.
+Each class role contains `class`, `mro`, `mro_truncated`; type descriptors contain
+only `module` and `qualname`. `underlying_send` contains `module`, `qualname`,
+`bound_callable_type`, `code`. Names are capped at 256 characters, sender at 128.
+
+The optional code fingerprint hashes the captured code object with Python marshal
+format 4 and identifies the Python major/minor version. It does not serialize a
+function's globals, closures or bound instance. Recursive code traversal is
+limited to depth 12, 4096 nodes, 256 KiB of estimated variable-size content and
+1024 elements per collection; the marshalled payload is capped at 1 MiB. This is
+an identity fingerprint, not a portable equivalence test or proof of all runtime
+behavior. An unavailable `__code__` is explicit. A code object exposed by a
+compiled callable can be metadata rather than its implementation; no native
+machine-code identity is claimed.
+
+Module details are allowlisted to `dbus_fast.*`, `asyncio.*`, `builtins`, `_asyncio`
+and this diagnostic module. At most eight modules expose `file`, `spec_origin`
+(each capped at 512 characters), a status and, when possible, a current regular
+file SHA-256 and size. File reads are capped at 4 MiB per file and 8 MiB per record,
+with metadata checked before/after reading. These are byte/count bounds, not a
+filesystem I/O wall-clock deadline. File access failures and oversize files are
+explicit; error messages are omitted. **A current file hash is not proof of the
+bytes loaded into memory.** Successful file records always say
+`loaded_bytes_verified: false`; no loaded mapping or compiled memory is inspected.
+
+The emitted dictionary representation is capped at 32768 UTF-8 bytes, excluding
+the existing logger prefix. An oversize or otherwise unserializable record is
+dropped. Background work and missing provenance cannot change transport success,
+ACK handling, fallback decisions or control flags. A missing record is unavailable
+evidence, never proof that the writer implementation was verified.
