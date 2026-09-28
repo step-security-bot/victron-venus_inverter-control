@@ -26,6 +26,9 @@ def test_write_timing_partitions_phases_and_keeps_only_correlation_fields(native
         "completed_at": 10.25,
         "returned_at": 10.30,
         "call_started_at": 10.125,
+        "send_started_at": 10.13,
+        "send_returned_at": 10.14,
+        "send_done_observed_at": 10.16,
         "reply_observed_at": 10.20,
         "call_finished_at": 10.24,
         "caller_native_tid": 321,
@@ -50,6 +53,9 @@ def test_write_timing_partitions_phases_and_keeps_only_correlation_fields(native
             "caller_wakeup_ms": 50.0,
             "call_to_reply_observer_ms": 75.0,
             "reply_observer_to_resume_ms": 40.0,
+            "send_sync_ms": 10.0,
+            "send_return_to_done_observer_ms": 20.0,
+            "send_future_cancelled": None,
         }
     ]
     assert native.drain_write_timings() == []
@@ -92,6 +98,9 @@ def test_slow_write_diagnostics_are_bounded_and_do_not_log_in_caller(native):
             "caller_wakeup_ms",
             "call_to_reply_observer_ms",
             "reply_observer_to_resume_ms",
+            "send_sync_ms",
+            "send_return_to_done_observer_ms",
+            "send_future_cancelled",
         }
         assert all(
             value >= 0 for key, value in sample.items() if key.endswith("_ms") and value is not None

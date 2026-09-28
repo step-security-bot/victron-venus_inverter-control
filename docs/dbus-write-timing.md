@@ -10,6 +10,41 @@ Each native record contains a D-Bus unique sender name, message serial, process 
 OS thread IDs, monotonic stage anchors and durations.
 Command values, message bodies, destination services and paths are omitted.
 
+The dedicated writer additionally observes the public `MessageBus.send()` return
+Future. The telemetry reader retains the original bus class. An opt-in subclass
+calls the original `send()` exactly once and returns that identical Future;
+`call()`, reply handling, timeout and fallback behavior remain unchanged. It does
+not await or cancel the send Future, or consume its result/exception.
+
+Three additional monotonic anchors distinguish the send stage:
+
+- `send_started_at`: entry to the original public `send()` for this exact message.
+- `send_returned_at`: the original `send()` returned its Future. In dbus-fast
+  2.21.1, marshalling and an immediate socket write can happen synchronously here.
+- `send_done_observed_at`: the returned Future was observed done, either inline
+  when already done or in an event-loop callback. A queued callback can be delayed
+  by scheduling; this is not the exact socket-write completion or kernel timestamp.
+
+`send_sync_ms` spans send entry through return. `send_return_to_done_observer_ms`
+spans return through the done observation. `send_future_cancelled` is a boolean
+when completion was observed, otherwise `None`. Done does not imply success:
+the observer deliberately does not retrieve an exception. A disconnect may also
+resolve the send Future without delivering the message. The normal confirmed
+application reply remains the only write-acceptance decision. Interpret these
+anchors as send-stage evidence only for confirmed calls, and retain independent
+monitor timing and the existing reply observer.
+
+Observations are keyed by message identity, excluding unrelated bus traffic.
+Their callbacks and registrations are removed when the call finishes or is
+cancelled, and when the observed connection fails, is replaced or is closed.
+Connection cleanup disables new observations on that bus and runs on its original
+loop before client shutdown stops it. This only releases diagnostic observers;
+it does not change the existing pending transport-task teardown.
+Missing or later observations remain `None`; cleanup never cancels the
+transport Future or waits for it. Existing strict offline parsers must explicitly
+accept these additional anchors/fields before using the new records. Historical
+parser schemas and captures must remain unchanged.
+
 - `total_ms`: after Variant/Message construction, immediately before resolving
   the connection, through return to the synchronous caller.
 - `setup_ms`: connection resolution and submission preparation.

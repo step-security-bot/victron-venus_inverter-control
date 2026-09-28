@@ -286,7 +286,7 @@ class VictronDBus:
             self._native = NativeDbusClient()
             # No telemetry subscriptions or reseeding hook on the writer.
             # Separate locks alone cannot isolate work on a shared event loop.
-            self._native_write = NativeDbusClient()
+            self._native_write = NativeDbusClient(observe_write_send=True)
             # Set up NameOwnerChanged handler for service discovery
             self._native.add_name_owner_handler(self._on_name_owner_changed)
 

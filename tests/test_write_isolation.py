@@ -115,10 +115,16 @@ def test_writer_reconnect_does_not_reseed_or_disconnect_telemetry(facade):
 
     replacement = EndpointBus()
     replacement.add_message_handler = Mock()
-    connector = Mock(connect=AsyncMock(return_value=replacement))
+
+    class Connector:
+        def __init__(self, **_kwargs):
+            pass
+
+        connect = AsyncMock(return_value=replacement)
+
     writer._fail_until = 0
     with (
-        patch("dbus_fast.aio.message_bus.MessageBus", return_value=connector),
+        patch("dbus_fast.aio.message_bus.MessageBus", Connector),
         patch.object(telemetry, "_replay_subscriptions") as reseed,
         patch.object(facade, "_safe_subprocess") as cli,
     ):
