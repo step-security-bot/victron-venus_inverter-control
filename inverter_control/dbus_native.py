@@ -72,6 +72,7 @@ class _SendObservation:
         try:
             self.timing["send_started_at"] = time.monotonic()
         except Exception:
+            # Missing optional timing must never prevent the original send.
             pass
 
     def returned(self, future):
@@ -85,6 +86,7 @@ class _SendObservation:
             else:
                 future.add_done_callback(self._done)
         except Exception:
+            # Return the original Future even if diagnostic setup fails.
             pass
 
     def _done(self, future):
@@ -96,6 +98,7 @@ class _SendObservation:
             # Do not call result()/exception(): observation must neither
             # consume an error nor mistake Future completion for an ACK.
         except Exception:
+            # A diagnostic callback must not raise into the transport loop.
             pass
 
     def close(self):
@@ -361,6 +364,7 @@ class NativeDbusClient:
                 try:
                     stop_send_observer = bus.observe_send(message, timing)
                 except Exception:
+                    # An unavailable observer must not prevent the actual call.
                     pass
 
             def observe_reply(reply):
@@ -389,6 +393,7 @@ class NativeDbusClient:
                 try:
                     stop_send_observer()
                 except Exception:
+                    # Preserve the call's result/error if optional cleanup fails.
                     pass
             if observer is not None:
                 try:
