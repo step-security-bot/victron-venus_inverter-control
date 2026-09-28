@@ -35,9 +35,11 @@ cancellation completes after the caller has returned, anchors may be later than
 `phase: write_lock` is a separate record when the outer VictronDBus `_set_lock`
 wait alone reaches 200 ms, before either native or CLI transport. It carries the
 caller OS thread ID, `lock_requested_at`, `lock_acquired_at` and `lock_wait_ms`.
-At most 64 lock records are retained separately. These are not native-call totals;
-matching process/thread and monotonic bounds identifies the following synchronous
-native call, when present. Fast lock waits are not emitted. CLI fallback and
+At most 64 lock records are retained separately. These are not native-call totals.
+Process/thread and monotonic bounds locate the contention in a simultaneous
+capture, but there is no explicit lock-record to native-serial link. Do not assume
+that the next slow native record belongs to the same write: intervening fast
+native calls or CLI writes may be unrecorded. Fast lock waits are not emitted. CLI fallback and
 Variant/Message construction are still outside the native total. A rejected native
 call followed by CLI does not count as two lock acquisitions.
 
