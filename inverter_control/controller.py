@@ -1092,6 +1092,9 @@ class InverterController:
             "grid_backup_available": sys_data.get("_grid_backup_available", False),
             "grid_backup": sys_data.get("_grid_backup_status"),
             "grid_primary_reason": sys_data.get("_grid_primary_reason"),
+            "grid_source_transitions": [
+                dict(event) for event in sys_data.get("_grid_source_transitions", [])
+            ],
         }
 
     def _grid_ready_for_control(self, sys_data: dict[str, Any]) -> bool:
