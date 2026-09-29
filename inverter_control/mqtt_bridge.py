@@ -297,19 +297,26 @@ class MQTTBridge:
             )
             self._publish_thread.start()
 
-    def publish_state(self, state: dict[str, Any]):
-        """Publish current state (async, non-blocking)"""
+    def publish_state(self, state: dict[str, Any]) -> bool:
+        """Encode and enqueue current state; True means acceptance, not delivery."""
         if not self._connected:
-            return
+            return False
 
         try:
-            payload = json.dumps(state, cls=SafeEncoder)
+            try:
+                # Finite telemetry needs no recursive copy before JSON encoding.
+                payload = json.dumps(state, allow_nan=False)
+            except ValueError:
+                # Keep the existing non-finite normalization and error behavior.
+                payload = json.dumps(state, cls=SafeEncoder)
             self._ensure_publish_thread()
             self._publish_queue.put_nowait((f"{self.prefix}/state", payload, 0, True))
+            return True
         except queue.Full:
             logger.debug("MQTT publish queue full, dropping state update")
         except Exception as e:
             logger.debug(f"MQTT publish queue error: {e}")
+        return False
 
     def publish_setpoint_override(self, status: dict[str, Any]) -> None:
         """Retained daemon acknowledgement; reconnect republishes current intent."""
