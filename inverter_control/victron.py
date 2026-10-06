@@ -117,6 +117,7 @@ SHUNT_SIGNAL_PATHS = {
 # the cached dict can hold only a subset briefly at startup; get_system_data
 # merges over these defaults so a partial cache never KeyErrors.
 _SYSTEM_DATA_KEYS = frozenset({"g1", "g2", "gt", "t1", "t2", "tt", "bv", "bc", "bp"})
+SHUNT_READ_MAX_AGE = 70.0  # two 30s reconciliation opportunities plus margin
 # MPPT chargers, PV inverters and Vue acloads are signal-driven too;
 # their single-value reads remain only as a slow reconciliation pass.
 MPPT_SIGNAL_PATHS = {
@@ -221,10 +222,6 @@ class VictronDBus:
         # Cache for battery chain SoC
         self._cached_battery_chain_socs: list = []
         self._last_battery_chain_soc_time: float = 0.0
-        # Last known-good SoC per chain service, retained so a transient read
-        # failure (e.g. mqtt_chain1 unresponsive, 2026-08-27) never collapses a
-        # live chain to a fake 0.0% that DVCC/control would act on.
-        self._last_known_chain_soc: dict[str, float] = {}
         # Cache for inverter state
         self._cached_inverter_state: tuple[int, str] = (0, "Unknown")
         self._last_inverter_state_time: float = 0.0
@@ -319,6 +316,8 @@ class VictronDBus:
         self._poll_stop_event = threading.Event()
         self._poll_interval = 0.2  # Poll at 5Hz, faster than control loop (3Hz)
         self._system_data: dict[str, Any] = {}  # Populated by background polling
+        self._shunt_read_times: dict[str, float] = {}
+        self._shunt_connected: bool | None = None
         if not test_mode:
             self._start_background_polling()
 
@@ -331,6 +330,7 @@ class VictronDBus:
         ]
         if self._shunt_service:
             targets.extend((self._shunt_service, path) for path in SHUNT_SIGNAL_PATHS)
+            targets.append((self._shunt_service, "/Connected"))
         if self._vebus_service:
             targets.append((self._vebus_service, VEBUS_STATE_PATH))
             targets.append((self._vebus_service, VEBUS_INV_POWER_PATH))
@@ -550,6 +550,21 @@ class VictronDBus:
         if service == SETTINGS_SERVICE and path == TIME_ZONE_PATH:
             self._set_grid_energy_timezone(raw)
             return
+        if service is not None and service == self._shunt_service:
+            if path == "/Connected":
+                self._shunt_connected = self._optional_float(raw) == 1
+                if not self._shunt_connected:
+                    self._clear_shunt_data()
+                return
+            key = SHUNT_SIGNAL_PATHS.get(path)
+            if key:
+                value = self._optional_float(raw)
+                if key == "bv" and value is not None and value <= 0:
+                    value = None
+                self._system_data[key] = value
+                self._shunt_read_times[key] = time.monotonic()
+                if value is None:
+                    return
         meter_updated = False
         with self._grid_energy_timezone_lock:
             generation = self._grid_telemetry.generation
@@ -727,6 +742,9 @@ class VictronDBus:
                 break
 
         self._log_service_changes(old_vebus, old_shunt)
+        if old_shunt != self._shunt_service:
+            self._clear_shunt_data()
+            self._shunt_connected = None
 
     def get_service_names(self) -> tuple[str, ...]:
         """Return the current background-discovery snapshot without bus I/O."""
@@ -1130,13 +1148,18 @@ class VictronDBus:
     def _poll_shunt_data(self):
         """Poll bank V/I/P from the SmartShunt service (tree query)."""
         if not self._shunt_service:
+            self._clear_shunt_data()
             return
         fields, deadline = self._native_reconciliation_read(self._shunt_service)
         if fields is not None:
             parsed = self._snapshot_numbers(fields, SHUNT_SIGNAL_PATHS)
             if "bp" in parsed:
                 parsed["bp"] = int(parsed["bp"])
-            self._system_data.update(parsed)
+            connected = fields.get("/Connected")
+            self._shunt_connected = (
+                None if connected is None else self._optional_float(connected) == 1
+            )
+            self._accept_shunt_data(parsed)
             self._system_data["_last_update"] = time.time()
             return
         output = self._reconciliation_fallback(
@@ -1152,8 +1175,54 @@ class VictronDBus:
             deadline=deadline,
         )
         if output:
-            self._system_data.update(parse_shunt_data_output(output))
+            self._shunt_connected = self._tree_bool(output, "Connected")
+            self._accept_shunt_data(parse_shunt_data_output(output))
             self._system_data["_last_update"] = time.time()
+        else:
+            self._clear_shunt_data()
+
+    def _clear_shunt_data(self) -> None:
+        for key in SHUNT_SIGNAL_PATHS.values():
+            self._system_data[key] = None
+        self._shunt_read_times.clear()
+
+    def _accept_shunt_data(self, values: dict) -> None:
+        if self._shunt_connected is False:
+            self._clear_shunt_data()
+            return
+        for key in SHUNT_SIGNAL_PATHS.values():
+            self._system_data[key] = values.get(key)
+            self._shunt_read_times[key] = time.monotonic()
+
+    def _merge_battery_status(self, data: dict) -> None:
+        """Expose local read quality without claiming a physical sample timestamp."""
+        now = time.monotonic()
+        reason = None
+        if not self._shunt_service:
+            reason = "missing_source"
+        elif self._shunt_connected is False:
+            reason = "disconnected"
+        ages = []
+        for key in SHUNT_SIGNAL_PATHS.values():
+            value = self._optional_float(data.get(key))
+            observed = self._shunt_read_times.get(key)
+            age = now - observed if observed is not None else None
+            if age is not None:
+                ages.append(age)
+            if age is not None and not 0 <= age <= SHUNT_READ_MAX_AGE:
+                value = None
+                reason = reason or "stale_read"
+            if key == "bv" and value is not None and value <= 0:
+                value = None
+            data[key] = None if reason in ("missing_source", "disconnected") else value
+        available = all(data.get(key) is not None for key in ("bv", "bc", "bp"))
+        data["battery_data"] = {
+            "available": available,
+            "reason": reason or (None if available else "incomplete"),
+            "source": self._shunt_service,
+            "read_age_seconds": max(ages) if ages else None,
+            "sample_age_seconds": None,
+        }
 
     def _native_reconciliation_read(
         self, service: str, path: str | None = None
@@ -1254,7 +1323,7 @@ class VictronDBus:
         }
         self._last_acload_time = time.time()
 
-    def _query_battery_chain_socs(self) -> list[float]:
+    def _query_battery_chain_socs(self) -> list[float | None]:
         """Query all battery chain services for SoC (shared by poll and fallback).
 
         Goes through the native-first _dbus_get helper on purpose: the
@@ -1265,19 +1334,16 @@ class VictronDBus:
         """
         socs = []
         for service in (BATTERY_CHAIN_1, BATTERY_CHAIN_2):
+            if not self._battery_source_status(service)["available"]:
+                socs.append(None)
+                continue
             val = self._dbus_get(service, "/Soc")
             try:
                 soc = float(val) if val is not None else None
             except (TypeError, ValueError):
                 logger.debug("Battery chain SoC parse failed: %s", val)
                 soc = None
-            if soc is not None:
-                self._last_known_chain_soc[service] = soc
-                socs.append(soc)
-            else:
-                # Fall back to the last known-good value for this chain instead
-                # of a fabricated 0.0 (a 0% SoC would wrongly throttle DVCC).
-                socs.append(self._last_known_chain_soc.get(service, 0.0))
+            socs.append(soc if soc is not None and math.isfinite(soc) and 0 <= soc <= 100 else None)
         return socs
 
     def _poll_battery_chain_socs(self):
@@ -1919,7 +1985,8 @@ class VictronDBus:
             # g1/g2/t1/t2/gt/tt/bv/bc/bp directly) never KeyError on startup.
             data = dict(self._system_data)
             for k in _SYSTEM_DATA_KEYS:
-                data.setdefault(k, 0)
+                data.setdefault(k, None if k in SHUNT_SIGNAL_PATHS.values() else 0)
+            self._merge_battery_status(data)
             self._merge_grid_status(data)
             return data
 
@@ -1931,9 +1998,9 @@ class VictronDBus:
             "t1": 0,
             "t2": 0,
             "tt": 0,
-            "bv": 0.0,
-            "bc": 0.0,
-            "bp": 0,
+            "bv": None,
+            "bc": None,
+            "bp": None,
             "pv_total": 0,
         }
 
@@ -1955,6 +2022,7 @@ class VictronDBus:
                 self._invalidate_grid_snapshot(generation, "System grid read unavailable")
             self._schedule_grid_retry()
             self._merge_grid_status(data)
+            self._merge_battery_status(data)
             return data
 
         parsed = parse_system_data_output(output)
@@ -1978,7 +2046,11 @@ class VictronDBus:
                 timeout=0.5,
             )
             if shunt_output:
-                data.update(parse_shunt_data_output(shunt_output))
+                self._shunt_connected = self._tree_bool(shunt_output, "Connected")
+                parsed = parse_shunt_data_output(shunt_output)
+                self._accept_shunt_data(parsed)
+                data.update(parsed)
+        self._merge_battery_status(data)
         self._merge_grid_status(data)
         return data
 
@@ -2023,7 +2095,7 @@ class VictronDBus:
         self._last_inverter_state_time = time.time()
         return self._cached_inverter_state
 
-    def get_battery_soc_local(self, sys_data: dict[str, Any] | None = None) -> float:
+    def get_battery_soc_local(self, sys_data: dict[str, Any] | None = None) -> float | None:
         """
         Calculate battery SOC locally from D-Bus voltage (HA "Battery %" paradigm).
         Replaces the shunt's own SoC, which reads bogus 100% while charging.
@@ -2031,7 +2103,7 @@ class VictronDBus:
         """
         if sys_data is None:
             sys_data = self.get_system_data()
-        voltage = sys_data.get("bv", 0.0)
+        voltage = sys_data.get("bv")
 
         return calculate_battery_soc_from_voltage(voltage)
 
@@ -2262,6 +2334,47 @@ class VictronDBus:
                     self._ess_mode_cache_time = 0.0
 
     @staticmethod
+    def _optional_float(raw) -> float | None:
+        try:
+            value = float(raw)
+            return value if math.isfinite(value) else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def _battery_source_status(self, service: str) -> dict:
+        """Check upstream readiness; only upstream timestamps describe sample age."""
+        status = {
+            "available": False,
+            "reason": "disconnected",
+            "source": service,
+            "sample_age_seconds": None,
+        }
+        if (
+            not self._service_healthy(service)
+            or self._optional_float(self._dbus_get(service, "/Connected")) != 1
+        ):
+            return status
+        complete = self._optional_float(self._dbus_get_native_only(service, "/Info/DataComplete"))
+        sampled = self._optional_float(
+            self._dbus_get_native_only(service, "/Info/LastMeasurementMonotonic")
+        )
+        timeout = self._optional_float(self._dbus_get_native_only(service, "/Info/DataTimeout"))
+        if complete is not None and complete != 1:
+            status["reason"] = "incomplete"
+            return status
+        if sampled is not None or timeout is not None:
+            status["reason"] = "incomplete"
+            if sampled is None or timeout is None or timeout <= 0:
+                return status
+            age = time.monotonic() - sampled
+            status["sample_age_seconds"] = age
+            if not 0 <= age < timeout:
+                status["reason"] = "stale_sample"
+                return status
+        status.update(available=True, reason=None)
+        return status
+
+    @staticmethod
     def _parse_float_or_zero(raw: str) -> float:
         """Parse a float from raw output, returning 0.0 on failure or non-finite."""
         try:
@@ -2315,7 +2428,9 @@ class VictronDBus:
         return self._parse_float_or_zero(parts[-1]) if parts else 0.0
 
     @staticmethod
-    def _battery_state(current: float) -> str:
+    def _battery_state(current: float | None) -> str:
+        if current is None:
+            return "Unknown"
         if current > 0.5:
             return "Charging"
         if current < -0.5:
@@ -2352,18 +2467,20 @@ class VictronDBus:
         ]
 
         def _query_battery(service: str, name: str) -> dict[str, Any]:
-            if not self._service_healthy(service):
+            quality = self._battery_source_status(service)
+            if not quality["available"]:
                 return {
                     "name": name,
-                    "voltage": 0.0,
-                    "current": 0.0,
-                    "power": 0,
-                    "soc": 0.0,
+                    "voltage": None,
+                    "current": None,
+                    "power": None,
+                    "soc": None,
                     "state": "Unknown",
                     "time_to_go": "",
                     "time_to_go_sec": None,
+                    **quality,
                 }
-            current = self._get_float(service, DC_CURRENT_PATH)
+            current = self._optional_float(self._dbus_get(service, DC_CURRENT_PATH))
             state = self._battery_state(current)
             ttg_sec = None
             # Native-only: these chain/virtual battery services do not export
@@ -2375,15 +2492,22 @@ class VictronDBus:
                     ttg_sec = max(0, int(float(ttg_raw)))
                 except (TypeError, ValueError):
                     pass
+            voltage = self._optional_float(self._dbus_get(service, "/Dc/0/Voltage"))
+            voltage = voltage if voltage is not None and voltage > 0 else None
+            soc = self._optional_float(self._dbus_get(service, "/Soc"))
+            soc = soc if soc is not None and 0 <= soc <= 100 else None
+            if voltage is None or current is None:
+                quality.update(available=False, reason="incomplete")
             return {
                 "name": name,
-                "voltage": self._get_float(service, "/Dc/0/Voltage"),
+                "voltage": voltage,
                 "current": current,
-                "power": self._get_float(service, "/Dc/0/Power"),
-                "soc": self._get_float(service, "/Soc"),
+                "power": self._optional_float(self._dbus_get(service, "/Dc/0/Power")),
+                "soc": soc,
                 "state": state,
                 "time_to_go": self._format_time_to_go(ttg_sec or 0, state),
                 "time_to_go_sec": ttg_sec,
+                **quality,
             }
 
         with ThreadPoolExecutor(max_workers=len(battery_services)) as pool:
