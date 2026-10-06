@@ -167,6 +167,20 @@ def test_failed_poll_cannot_clear_a_newer_valid_sample(device, monkeypatch):
     assert device.get_system_data()["bp"] == 123
 
 
+@pytest.mark.parametrize("missing_source", [False, True])
+def test_missing_shunt_reply_does_not_create_read_timestamps(device, monkeypatch, missing_source):
+    """No source or no response is an invalidation, never a fresh observation."""
+    if missing_source:
+        device._shunt_service = None
+    monkeypatch.setattr(device, "_native_reconciliation_read", lambda _: (None, None))
+    monkeypatch.setattr(device, "_reconciliation_fallback", lambda *a, **kw: None)
+    previous_update = device._system_data["_last_update"]
+    device._poll_shunt_data()
+    assert device._shunt_read_times == {}
+    assert device._system_data["_last_update"] == previous_update
+    assert device._system_data["bp"] is None
+
+
 def test_local_read_age_expires_without_claiming_physical_sample_age(device, monkeypatch):
     now = [100.0]
     monkeypatch.setattr("inverter_control.victron.time.monotonic", lambda: now[0])

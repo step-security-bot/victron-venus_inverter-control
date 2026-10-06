@@ -1214,8 +1214,11 @@ class VictronDBus:
             if token != self._shunt_token():
                 return False
             self._shunt_connected = connected
-            self._accept_shunt_data(values)
-            self._system_data["_last_update"] = time.time()
+            if values:
+                self._accept_shunt_data(values)
+                self._system_data["_last_update"] = time.time()
+            else:
+                self._clear_shunt_data()
             return True
 
     def _clear_shunt_data(self) -> None:
