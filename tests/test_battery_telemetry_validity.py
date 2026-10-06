@@ -9,6 +9,7 @@ from inverter_control.console_ui import ConsoleUI
 from inverter_control.victron import (
     BATTERY_CHAIN_1,
     SHUNT_READ_MAX_AGE,
+    SHUNT_SIGNAL_PATHS,
     VictronDBus,
 )
 from inverter_control.victron_parse import calculate_battery_soc_from_voltage
@@ -58,6 +59,112 @@ def test_disconnect_signal_clears_all_values(device):
     data = device.get_system_data()
     assert [data[key] for key in ("bv", "bc", "bp")] == [None] * 3
     assert data["battery_data"]["reason"] == "disconnected"
+
+
+def test_disconnected_signals_cannot_supply_readings_after_reconnect(device):
+    """Only readings observed after reconnection can restore availability."""
+    service = device._shunt_service
+    device._apply_fast_value(service, "/Connected", "0")
+    for path in SHUNT_SIGNAL_PATHS:
+        device._apply_fast_value(service, path, "52")
+    device._apply_fast_value(service, "/Connected", "1")
+    assert not device.get_system_data()["battery_data"]["available"]
+    assert device._shunt_read_times == {}
+    for path, value in zip(SHUNT_SIGNAL_PATHS, ("52", "0", "0"), strict=True):
+        device._apply_fast_value(service, path, value)
+    assert device.get_system_data()["battery_data"]["available"]
+
+
+@pytest.mark.parametrize("transport", ["native", "cli", "synchronous"])
+@pytest.mark.parametrize("newer", ["disconnect", "owner", "measurement"])
+def test_inflight_shunt_reply_cannot_overwrite_newer_observation(
+    device, monkeypatch, transport, newer
+):
+    """Interleave a newer event after read dispatch and before its old reply."""
+    from tests.test_native_reconciliation import tree
+
+    service = device._shunt_service
+    fields = {"/Connected": "1", "/Dc/0/Voltage": "54", "/Dc/0/Current": "2", "/Dc/0/Power": "108"}
+
+    def newer_event():
+        if newer == "disconnect":
+            device._apply_fast_value(service, "/Connected", "0")
+        elif newer == "owner":
+            device._on_name_owner_changed(service, ":1.1", ":1.2")
+        else:
+            device._apply_fast_value(service, "/Dc/0/Power", "0")
+
+    if transport == "native":
+
+        def native_reply(_service):
+            newer_event()
+            return fields, None
+
+        monkeypatch.setattr(device, "_native_reconciliation_read", native_reply)
+        device._poll_shunt_data()
+    else:
+
+        def old_reply(*_args, **_kwargs):
+            newer_event()
+            return tree(fields)
+
+        if transport == "cli":
+            monkeypatch.setattr(device, "_native_reconciliation_read", lambda _: (None, None))
+            monkeypatch.setattr(device, "_reconciliation_fallback", old_reply)
+            device._poll_shunt_data()
+        else:
+            device._system_data["_last_update"] = 0
+            monkeypatch.setattr(device, "_refresh_grid_meter", lambda _: None)
+            monkeypatch.setattr(
+                device,
+                "_safe_subprocess",
+                lambda args, **kwargs: (
+                    old_reply() if f"--dest={service}" in args else "system tree"
+                ),
+            )
+            data = device.get_system_data()
+            assert data["bp"] == (0 if newer == "measurement" else None)
+    data = device.get_system_data()
+    assert data["bp"] == (0 if newer == "measurement" else None)
+    if newer != "measurement":
+        assert not data["battery_data"]["available"]
+
+
+def test_old_display_copy_cannot_pair_with_new_read_timestamps(device):
+    """Display values and quality metadata must describe the same observation."""
+    old = dict(device._system_data)
+    device._apply_fast_value(device._shunt_service, "/Dc/0/Power", "123")
+    device._merge_battery_status(old)
+    assert old["bp"] == 123
+
+
+def test_seed_reply_cannot_undo_disconnect_received_during_seed_read(device, monkeypatch):
+    """A reconnect seed is subject to the same ordering guard as tree polls."""
+    service = device._shunt_service
+    device._native = Mock()
+    device._native.get_values.return_value = None
+    monkeypatch.setattr(device, "_fast_targets", lambda: [(service, "/Connected")])
+
+    def old_connected_reply(*_args):
+        device._apply_fast_value(service, "/Connected", "0")
+        return "1"
+
+    device._native.get_value.side_effect = old_connected_reply
+    device._seed_fast_values()
+    assert device._shunt_connected is False
+    assert not device.get_system_data()["battery_data"]["available"]
+
+
+def test_failed_poll_cannot_clear_a_newer_valid_sample(device, monkeypatch):
+    """A failed old request cannot erase telemetry received while it waited."""
+    monkeypatch.setattr(device, "_native_reconciliation_read", lambda _: (None, None))
+
+    def late_failure(*_args, **_kwargs):
+        device._apply_fast_value(device._shunt_service, "/Dc/0/Power", "123")
+
+    monkeypatch.setattr(device, "_reconciliation_fallback", late_failure)
+    device._poll_shunt_data()
+    assert device.get_system_data()["bp"] == 123
 
 
 def test_local_read_age_expires_without_claiming_physical_sample_age(device, monkeypatch):

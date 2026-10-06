@@ -187,6 +187,8 @@ class VictronDBus:
         self._last_success_time: float = 0
         self._last_rescan_time: float = 0  # Cooldown tracker for error-triggered rescans
         self._dbus_lock = threading.Lock()
+        self._shunt_lock = threading.RLock()
+        self._shunt_generation = 0
         # Setpoint writes get their own lock so a telemetry read holding
         # _dbus_lock can never delay the control-loop write path.
         self._set_lock = threading.Lock()
@@ -329,8 +331,8 @@ class VictronDBus:
             (SYSTEM_SERVICE, path) for path in dict.fromkeys((*SYSTEM_SIGNAL_PATHS, *GRID_PATHS))
         ]
         if self._shunt_service:
-            targets.extend((self._shunt_service, path) for path in SHUNT_SIGNAL_PATHS)
             targets.append((self._shunt_service, "/Connected"))
+            targets.extend((self._shunt_service, path) for path in SHUNT_SIGNAL_PATHS)
         if self._vebus_service:
             targets.append((self._vebus_service, VEBUS_STATE_PATH))
             targets.append((self._vebus_service, VEBUS_INV_POWER_PATH))
@@ -450,7 +452,14 @@ class VictronDBus:
         for service, path in self._fast_targets():
             if service == SYSTEM_SERVICE and path in GRID_PATHS:
                 continue
-            self._apply_fast_value(service, path, self._native.get_value(service, path))
+            token = self._shunt_token() if service == self._shunt_service else None
+            raw = self._native.get_value(service, path)
+            if token is None:
+                self._apply_fast_value(service, path, raw)
+            else:
+                with self._shunt_lock:
+                    if token == self._shunt_token():
+                        self._apply_fast_value(service, path, raw)
         self._last_signal_reconcile = time.monotonic()
 
     def _signals_healthy(self) -> bool:
@@ -550,20 +559,28 @@ class VictronDBus:
         if service == SETTINGS_SERVICE and path == TIME_ZONE_PATH:
             self._set_grid_energy_timezone(raw)
             return
-        if service is not None and service == self._shunt_service:
-            if path == "/Connected":
-                self._shunt_connected = self._optional_float(raw) == 1
-                if not self._shunt_connected:
-                    self._clear_shunt_data()
-                return
-            key = SHUNT_SIGNAL_PATHS.get(path)
-            if key:
-                value = self._optional_float(raw)
-                if key == "bv" and value is not None and value <= 0:
-                    value = None
-                self._system_data[key] = value
-                self._shunt_read_times[key] = time.monotonic()
-                if value is None:
+        with self._shunt_lock:
+            if service is not None and service == self._shunt_service:
+                if path == "/Connected":
+                    self._shunt_generation += 1
+                    self._shunt_connected = self._optional_float(raw) == 1
+                    if not self._shunt_connected:
+                        self._clear_shunt_data()
+                    return
+                key = SHUNT_SIGNAL_PATHS.get(path)
+                if key:
+                    self._shunt_generation += 1
+                    if self._shunt_connected is False:
+                        return
+                    value = self._optional_float(raw)
+                    if key == "bv" and value is not None and value <= 0:
+                        value = None
+                    self._system_data[key] = (
+                        round(value) if key == "bp" and value is not None else value
+                    )
+                    self._shunt_read_times[key] = time.monotonic()
+                    self._system_data["_last_update"] = time.time()
+                    self._last_signal_ok_monotonic = time.monotonic()
                     return
         meter_updated = False
         with self._grid_energy_timezone_lock:
@@ -735,16 +752,17 @@ class VictronDBus:
 
         # The SmartShunt's bus-name suffix (ttyUSB4 today) can change
         # across GX reboots, so match by ProductName, never by instance.
-        self._shunt_service = None
+        selected_shunt = None
         for candidate in battery_candidates:
             if "shunt" in self._read_product_name(candidate).lower():
-                self._shunt_service = candidate
+                selected_shunt = candidate
                 break
-
+        with self._shunt_lock:
+            self._shunt_service = selected_shunt
+            if old_shunt != self._shunt_service:
+                self._clear_shunt_data()
+                self._shunt_connected = None
         self._log_service_changes(old_vebus, old_shunt)
-        if old_shunt != self._shunt_service:
-            self._clear_shunt_data()
-            self._shunt_connected = None
 
     def get_service_names(self) -> tuple[str, ...]:
         """Return the current background-discovery snapshot without bus I/O."""
@@ -839,6 +857,10 @@ class VictronDBus:
         - A service gains an owner (appears on the bus)
         - A service loses its owner (disappears from the bus)
         """
+        with self._shunt_lock:
+            if service_name == self._shunt_service:
+                self._shunt_connected = False
+                self._clear_shunt_data()
         with self._grid_energy_timezone_lock:
             grid_changed = self._grid_telemetry.owner_changed(service_name)
             if grid_changed:
@@ -1147,55 +1169,84 @@ class VictronDBus:
 
     def _poll_shunt_data(self):
         """Poll bank V/I/P from the SmartShunt service (tree query)."""
-        if not self._shunt_service:
-            self._clear_shunt_data()
+        token = self._shunt_token()
+        service, _generation = token
+        if not service:
+            self._commit_shunt_snapshot(token, None, {})
             return
-        fields, deadline = self._native_reconciliation_read(self._shunt_service)
+        fields, deadline = self._native_reconciliation_read(service)
         if fields is not None:
             parsed = self._snapshot_numbers(fields, SHUNT_SIGNAL_PATHS)
             if "bp" in parsed:
                 parsed["bp"] = int(parsed["bp"])
             connected = fields.get("/Connected")
-            self._shunt_connected = (
-                None if connected is None else self._optional_float(connected) == 1
+            self._commit_shunt_snapshot(
+                token, None if connected is None else self._optional_float(connected) == 1, parsed
             )
-            self._accept_shunt_data(parsed)
-            self._system_data["_last_update"] = time.time()
             return
         output = self._reconciliation_fallback(
             [
                 "dbus-send",
                 "--system",
                 "--print-reply",
-                f"--dest={self._shunt_service}",
+                f"--dest={service}",
                 "/",
                 GET_VALUE_METHOD,
             ],
-            service=self._shunt_service,
+            service=service,
             deadline=deadline,
         )
         if output:
-            self._shunt_connected = self._tree_bool(output, "Connected")
-            self._accept_shunt_data(parse_shunt_data_output(output))
-            self._system_data["_last_update"] = time.time()
+            self._commit_shunt_snapshot(
+                token, self._tree_bool(output, "Connected"), parse_shunt_data_output(output)
+            )
         else:
-            self._clear_shunt_data()
+            self._commit_shunt_snapshot(token, None, {})
+
+    def _shunt_token(self) -> tuple[str | None, int]:
+        """Identify the source and latest observation before starting a read."""
+        with self._shunt_lock:
+            return self._shunt_service, self._shunt_generation
+
+    def _commit_shunt_snapshot(self, token, connected, values) -> bool:
+        """Reject a reply superseded by a signal, disconnect, or source change."""
+        with self._shunt_lock:
+            if token != self._shunt_token():
+                return False
+            self._shunt_connected = connected
+            self._accept_shunt_data(values)
+            self._system_data["_last_update"] = time.time()
+            return True
 
     def _clear_shunt_data(self) -> None:
-        for key in SHUNT_SIGNAL_PATHS.values():
-            self._system_data[key] = None
-        self._shunt_read_times.clear()
+        """Invalidate cached measurements and any in-flight older read."""
+        with self._shunt_lock:
+            self._shunt_generation += 1
+            for key in SHUNT_SIGNAL_PATHS.values():
+                self._system_data[key] = None
+            self._shunt_read_times.clear()
 
     def _accept_shunt_data(self, values: dict) -> None:
-        if self._shunt_connected is False:
-            self._clear_shunt_data()
-            return
-        for key in SHUNT_SIGNAL_PATHS.values():
-            self._system_data[key] = values.get(key)
-            self._shunt_read_times[key] = time.monotonic()
+        """Atomically replace one accepted snapshot and its local read ages."""
+        with self._shunt_lock:
+            if self._shunt_connected is False:
+                self._clear_shunt_data()
+                return
+            self._shunt_generation += 1
+            for key in SHUNT_SIGNAL_PATHS.values():
+                self._system_data[key] = values.get(key)
+                self._shunt_read_times[key] = time.monotonic()
 
     def _merge_battery_status(self, data: dict) -> None:
         """Expose local read quality without claiming a physical sample timestamp."""
+        with self._shunt_lock:
+            # A caller's copy may precede a signal. Pair current measurements
+            # with their own connection state and timestamps, under one lock.
+            data.update({key: self._system_data.get(key) for key in SHUNT_SIGNAL_PATHS.values()})
+            self._merge_battery_status_locked(data)
+
+    def _merge_battery_status_locked(self, data: dict) -> None:
+        """Compose availability while the battery observation lock is held."""
         now = time.monotonic()
         reason = None
         if not self._shunt_service:
@@ -2033,23 +2084,28 @@ class VictronDBus:
         data.update(parsed)
 
         # Bank V/I/P from the SmartShunt only (see SHUNT_SIGNAL_PATHS note).
-        if self._shunt_service:
+        token = self._shunt_token()
+        service, _generation = token
+        if service:
             shunt_output = self._safe_subprocess(
                 [
                     "dbus-send",
                     "--system",
                     "--print-reply",
-                    f"--dest={self._shunt_service}",
+                    f"--dest={service}",
                     "/",
                     GET_VALUE_METHOD,
                 ],
                 timeout=0.5,
             )
             if shunt_output:
-                self._shunt_connected = self._tree_bool(shunt_output, "Connected")
-                parsed = parse_shunt_data_output(shunt_output)
-                self._accept_shunt_data(parsed)
-                data.update(parsed)
+                self._commit_shunt_snapshot(
+                    token,
+                    self._tree_bool(shunt_output, "Connected"),
+                    parse_shunt_data_output(shunt_output),
+                )
+            else:
+                self._commit_shunt_snapshot(token, None, {})
         self._merge_battery_status(data)
         self._merge_grid_status(data)
         return data
