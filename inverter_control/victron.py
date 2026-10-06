@@ -224,6 +224,8 @@ class VictronDBus:
         # Cache for battery chain SoC
         self._cached_battery_chain_socs: list = []
         self._last_battery_chain_soc_time: float = 0.0
+        self._timestamped_battery_sources: set[str] = set()
+        self._complete_battery_sources: set[str] = set()
         # Cache for inverter state
         self._cached_inverter_state: tuple[int, str] = (0, "Unknown")
         self._last_inverter_state_time: float = 0.0
@@ -2413,15 +2415,22 @@ class VictronDBus:
             or self._optional_float(self._dbus_get(service, "/Connected")) != 1
         ):
             return status
-        complete = self._optional_float(self._dbus_get_native_only(service, "/Info/DataComplete"))
-        sampled = self._optional_float(
-            self._dbus_get_native_only(service, "/Info/LastMeasurementMonotonic")
-        )
-        timeout = self._optional_float(self._dbus_get_native_only(service, "/Info/DataTimeout"))
-        if complete is not None and complete != 1:
+        complete_raw = self._dbus_get_native_only(service, "/Info/DataComplete")
+        sampled_raw = self._dbus_get_native_only(service, "/Info/LastMeasurementMonotonic")
+        timeout_raw = self._dbus_get_native_only(service, "/Info/DataTimeout")
+        if complete_raw is not None:
+            self._complete_battery_sources.add(service)
+        if sampled_raw is not None or timeout_raw is not None:
+            self._timestamped_battery_sources.add(service)
+        complete = self._optional_float(complete_raw)
+        sampled = self._optional_float(sampled_raw)
+        timeout = self._optional_float(timeout_raw)
+        # A failed native metadata read must not downgrade an observed contract
+        # to a legacy source merely because CLI Connected/Soc reads still work.
+        if service in self._complete_battery_sources and complete != 1:
             status["reason"] = "incomplete"
             return status
-        if sampled is not None or timeout is not None:
+        if service in self._timestamped_battery_sources:
             status["reason"] = "incomplete"
             if sampled is None or timeout is None or timeout <= 0:
                 return status

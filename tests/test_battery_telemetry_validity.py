@@ -213,6 +213,35 @@ def test_battery_source_frozen_timestamp_expires_and_recovers(device, monkeypatc
     assert device._battery_source_status(BATTERY_CHAIN_1)["reason"] == "incomplete"
 
 
+@pytest.mark.parametrize("metadata_kind", ["timestamp", "complete"])
+def test_observed_metadata_contract_cannot_disappear_into_legacy_fallback(
+    device, monkeypatch, metadata_kind
+):
+    """A successful CLI read cannot erase a previously observed native contract."""
+    monkeypatch.setattr("inverter_control.victron.time.monotonic", lambda: 100.0)
+    metadata = (
+        {"/Info/LastMeasurementMonotonic": "100", "/Info/DataTimeout": "60"}
+        if metadata_kind == "timestamp"
+        else {"/Info/DataComplete": "1"}
+    )
+    saved = dict(metadata)
+    monkeypatch.setattr(device, "_dbus_get_native_only", lambda _, path: metadata.get(path))
+    monkeypatch.setattr(device, "_dbus_get", lambda _, path: "1" if path == "/Connected" else "55")
+    assert device._battery_source_status(BATTERY_CHAIN_1)["available"]
+    metadata.clear()
+    assert device._battery_source_status(BATTERY_CHAIN_1)["reason"] == "incomplete"
+    assert device._query_battery_chain_socs()[0] is None
+    metadata.update(saved)
+    assert device._query_battery_chain_socs()[0] == 55
+
+
+def test_legacy_source_without_metadata_remains_supported(device, monkeypatch):
+    """Do not require new producer metadata from a genuine legacy source."""
+    monkeypatch.setattr(device, "_dbus_get_native_only", lambda *_: None)
+    monkeypatch.setattr(device, "_dbus_get", lambda *_: "1")
+    assert device._battery_source_status(BATTERY_CHAIN_1)["available"]
+
+
 def test_virtual_readiness_without_timestamp_and_real_zero_soc(device, monkeypatch):
     monkeypatch.setattr(
         device,

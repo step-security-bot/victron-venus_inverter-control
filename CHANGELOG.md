@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ignore SmartShunt readings received while disconnected. Require fresh readings
   after reconnecting, and reject in-flight poll or seed responses superseded by
   a newer signal or source-owner change. Read values and availability coherently.
+- Preserve observed freshness/completeness requirements when a later native
+  metadata read fails, instead of treating the source as a legacy battery.
 
 ### Validation
 - Cover delayed and disconnected sources, null readings, stale local reads,
